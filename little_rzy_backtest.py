@@ -46,9 +46,10 @@ class Params:
     entry_touch_tolerance: float = 0.001  # 0.1% counts as "touch"
 
     # Risk management
-    stop_buffer_atr: float = 0.5      # stop distance beyond trendline
+    stop_buffer_atr: float = 1.0       # stop distance beyond trendline (wider = fewer whipsaws)
     risk_per_trade: float = 0.01      # 1% account risk per trade
-    target_scale: float = 0.75        # target = impulse_extreme ± measured * target_scale
+    target_scale: float = 1.0         # target = impulse_extreme ± measured * target_scale
+    min_reward_risk: float = 1.5      # skip trade if target is less than 1.5R away at entry
 
     # Filters
     use_bollinger_filter: bool = True
@@ -503,6 +504,11 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
             risk_per_unit = entry_price - stop
 
         if risk_per_unit <= 0:
+            continue
+
+        # Skip if the target isn't at least min_reward_risk × risk away
+        reward = abs(s.target_price - entry_price)
+        if reward / risk_per_unit < P.min_reward_risk:
             continue
 
         trade = Trade(
