@@ -86,6 +86,29 @@ def load_yahoo() -> pd.DataFrame:
     return df
 
 
+def load_databento(api_key: str, start: str = "2020-01-01", end: str = "2025-01-01") -> pd.DataFrame:
+    import databento as db
+    client = db.Historical(key=api_key)
+    print(f"  Fetching ES.c.0 ohlcv-1m from {start} to {end}...")
+    data = client.timeseries.get_range(
+        dataset="GLBX.MDP3",
+        symbols=["ES.c.0"],
+        schema="ohlcv-1m",
+        stype_in="continuous",
+        start=start,
+        end=end,
+    )
+    df = data.to_df()
+    for c in ["open", "high", "low", "close"]:
+        df[c] = df[c] / 1e9          # Databento fixed-point prices
+    df = df[["open", "high", "low", "close", "volume"]]
+    df4h = df.resample("4h").agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
+    }).dropna()
+    return df4h
+
+
 def load_csv(path: str) -> pd.DataFrame:
     """
     Auto-detects CSV format from Barchart, Investing.com, TradingView,
@@ -630,8 +653,11 @@ def trades_to_df(trades: list[Trade], df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["yahoo", "csv", "synthetic"], default="synthetic")
+    parser.add_argument("--source", choices=["yahoo", "csv", "databento", "synthetic"], default="synthetic")
     parser.add_argument("--file", default=None)
+    parser.add_argument("--key", default=None, help="Databento API key")
+    parser.add_argument("--start", default="2020-01-01", help="Start date (databento)")
+    parser.add_argument("--end", default="2025-01-01", help="End date (databento)")
     parser.add_argument("--out", default=".")
     args = parser.parse_args()
 
@@ -640,6 +666,10 @@ def main():
         df = load_yahoo()
     elif args.source == "csv":
         df = load_csv(args.file)
+    elif args.source == "databento":
+        if not args.key:
+            raise SystemExit("--key is required for --source databento")
+        df = load_databento(args.key, args.start, args.end)
     else:
         df = generate_synthetic()
         print("  *** SYNTHETIC DATA — for code validation only, NOT a real backtest ***")
