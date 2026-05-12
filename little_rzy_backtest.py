@@ -33,7 +33,7 @@ class Params:
     ema_period: int = 50              # price above EMA = uptrend, below = downtrend
 
     # Impulse detection
-    impulse_atr_mult: float = 2.0     # impulse must move >= 2 ATR
+    impulse_atr_mult: float = 2.5     # impulse must move >= 2.5 ATR (was 2.0)
     impulse_max_bars: int = 8
     atr_period: int = 14
 
@@ -59,6 +59,12 @@ class Params:
     use_exhaustion_filter: bool = True
     max_rzy_per_trend: int = 2        # only first 2 RZYs per trend
 
+    # RTH filter: only keep 4H bars that open during Regular Trading Hours
+    # ES RTH = 09:30–16:00 ET. Bars starting at 09:00 or 13:00 ET cover RTH.
+    use_rth_filter: bool = True
+    rth_start_hour: int = 9           # ET hour (inclusive)
+    rth_end_hour: int = 16            # ET hour (exclusive)
+
     # Backtest engine
     starting_capital: float = 100_000
     commission_per_trade: float = 4.0  # ES futures roundtrip estimate
@@ -70,6 +76,18 @@ P = Params()
 # =============================================================================
 # DATA LOADING
 # =============================================================================
+def apply_rth_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only 4H bars whose open falls within RTH hours (ET)."""
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx_et = idx.tz_convert("America/New_York")
+    mask = (idx_et.hour >= P.rth_start_hour) & (idx_et.hour < P.rth_end_hour)
+    filtered = df[mask]
+    print(f"  RTH filter: {len(df)} -> {len(filtered)} bars")
+    return filtered
+
+
 def load_yahoo() -> pd.DataFrame:
     import yfinance as yf
     print("  Pulling ES=F from Yahoo Finance (1H, 730 days)...")
@@ -80,6 +98,8 @@ def load_yahoo() -> pd.DataFrame:
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum",
     }).dropna()
+    if P.use_rth_filter:
+        df = apply_rth_filter(df)
     return df
 
 
@@ -302,6 +322,11 @@ def detect_short_structures(df: pd.DataFrame) -> list[RZYStructure]:
             continue
         slope, intercept = np.polyfit(x, y, 1)
 
+        # Slope filter: pullback highs must be declining (resistance sloping down)
+        if slope >= 0:
+            i += 1
+            continue
+
         measured = (slope * low_iloc + intercept) - lowest_low
         if measured <= 0:
             i += 1
@@ -403,6 +428,11 @@ def detect_long_structures(df: pd.DataFrame) -> list[RZYStructure]:
             i += 1
             continue
         slope, intercept = np.polyfit(x, y, 1)
+
+        # Slope filter: pullback lows must be rising (support sloping up)
+        if slope <= 0:
+            i += 1
+            continue
 
         measured = highest_high - (slope * high_iloc + intercept)
         if measured <= 0:
