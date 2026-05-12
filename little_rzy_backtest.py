@@ -4,14 +4,14 @@ Little RZY Strategy Backtest
 Mechanical interpretation of Marci's "Little RZY" swing trading strategy.
 
 Run modes:
-    python little_rzy_backtest.py --source yahoo    # pull ES=F from yfinance
+    python little_rzy_backtest.py --source yahoo       # pull ES=F from yfinance (free, ~2yr)
     python little_rzy_backtest.py --source csv --file data.csv
-    python little_rzy_backtest.py --source synthetic # generate fake data for testing
+    python little_rzy_backtest.py --source synthetic   # fake data for smoke-testing
 
 Outputs:
-    - trades.csv (trade log)
-    - equity_curve.png
-    - sample_trades.png (3 annotated examples)
+    - trades.csv        (full trade log)
+    - equity_curve.png  (equity + drawdown chart)
+    - sample_trades.png (worst / median / best trade annotated)
     - stats printed to stdout
 """
 
@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -30,37 +30,33 @@ from typing import Optional
 @dataclass
 class Params:
     # Trend detection
-    ema_period: int = 50              # price below EMA = downtrend candidate
+    ema_period: int = 50              # price above EMA = uptrend, below = downtrend
 
     # Impulse detection
-    impulse_atr_mult: float = 2.0     # impulse must drop >= 2 ATR
-    impulse_max_bars: int = 8         # within this many bars
+    impulse_atr_mult: float = 2.0     # impulse must move >= 2 ATR
+    impulse_max_bars: int = 8
     atr_period: int = 14
 
     # Pullback detection
-    pullback_min_bars: int = 3        # at least N bars of bounce
-    pullback_max_bars: int = 12       # but not too long
-    pullback_min_pct: float = 0.30    # bounce >= 30% of impulse
+    pullback_min_bars: int = 3
+    pullback_max_bars: int = 12
+    pullback_min_pct: float = 0.30    # pullback must retrace >= 30% of impulse
 
-    # Trendline fit
-    # We use linear regression across the pullback highs (downtrend case)
-
-    # Entry trigger: STRICT mode = price touches trendline, then closes back below it
-    entry_touch_tolerance: float = 0.001  # 0.1% of price counts as "touch"
+    # Entry trigger: price touches trendline then closes back through it
+    entry_touch_tolerance: float = 0.001  # 0.1% counts as "touch"
 
     # Risk management
-    stop_buffer_atr: float = 0.5      # stop = trendline high + 0.5 ATR
-    risk_per_trade: float = 0.01      # 1% account risk
+    stop_buffer_atr: float = 0.5      # stop distance beyond trendline
+    risk_per_trade: float = 0.01      # 1% account risk per trade
+    target_scale: float = 0.75        # target = impulse_extreme ± measured * target_scale
 
     # Filters
     use_bollinger_filter: bool = True
     bb_period: int = 20
     bb_std: float = 2.0
-    # Bollinger filter: for shorts, prefer entries when price is near/above middle band
-    # (not already crushed at lower band)
 
     use_exhaustion_filter: bool = True
-    max_rzy_per_trend: int = 2        # only trade first 2 RZYs in a trend
+    max_rzy_per_trend: int = 2        # only first 2 RZYs per trend
 
     # Backtest engine
     starting_capital: float = 100_000
@@ -75,13 +71,13 @@ P = Params()
 # =============================================================================
 def load_yahoo() -> pd.DataFrame:
     import yfinance as yf
+    print("  Pulling ES=F from Yahoo Finance (1H, 730 days)...")
     df = yf.Ticker("ES=F").history(period="730d", interval="1h")
     df = df[["Open", "High", "Low", "Close", "Volume"]]
     df.columns = [c.lower() for c in df.columns]
-    # Resample 1H to 4H
     df = df.resample("4h").agg({
         "open": "first", "high": "max", "low": "min",
-        "close": "last", "volume": "sum"
+        "close": "last", "volume": "sum",
     }).dropna()
     return df
 
@@ -100,46 +96,38 @@ def load_databento(api_key: str, start: str = "2020-01-01", end: str = "2025-01-
     )
     df = data.to_df()
     for c in ["open", "high", "low", "close"]:
-        df[c] = df[c] / 1e9          # Databento fixed-point prices
+        df[c] = df[c] / 1e9
     df = df[["open", "high", "low", "close", "volume"]]
-    df4h = df.resample("4h").agg({
+    return df.resample("4h").agg({
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum",
     }).dropna()
-    return df4h
 
 
 def load_csv(path: str) -> pd.DataFrame:
     """
     Auto-detects CSV format from Barchart, Investing.com, TradingView,
-    or any file written by fetch_data.py (standard datetime index + OHLCV).
+    or any standard OHLCV export (datetime index + open/high/low/close/volume).
     """
     raw = pd.read_csv(path, thousands=",")
     raw.columns = [c.strip().lower().replace(" ", "_").replace("%", "pct")
                    for c in raw.columns]
 
-    # --- find the datetime column ---
     dt_candidates = [c for c in raw.columns if c in
                      ("datetime", "date", "time", "timestamp", "bar_time")]
-    if not dt_candidates:
-        # Fall back: use first column
-        dt_candidates = [raw.columns[0]]
-    dt_col = dt_candidates[0]
+    dt_col = dt_candidates[0] if dt_candidates else raw.columns[0]
 
-    # TradingView uses Unix seconds for "time"
     if dt_col == "time" and pd.to_numeric(raw[dt_col], errors="coerce").notna().all():
         raw["datetime"] = pd.to_datetime(raw[dt_col], unit="s", utc=True)
     else:
         raw["datetime"] = pd.to_datetime(raw[dt_col])
     raw = raw.set_index("datetime").sort_index()
 
-    # --- normalize close column (Investing.com calls it "price") ---
     if "close" not in raw.columns and "price" in raw.columns:
         raw = raw.rename(columns={"price": "close"})
     if "close" not in raw.columns and "last" in raw.columns:
         raw = raw.rename(columns={"last": "close"})
 
-    # --- volume: handle K/M suffixes (Investing.com) ---
     if "volume" not in raw.columns:
         vol_col = next((c for c in raw.columns if "vol" in c), None)
         if vol_col:
@@ -163,61 +151,50 @@ def load_csv(path: str) -> pd.DataFrame:
         raw["volume"] = 0.0
 
     for c in ["open", "high", "low", "close"]:
-        raw[c] = pd.to_numeric(
-            raw[c].astype(str).str.replace(",", ""), errors="coerce"
-        )
+        raw[c] = pd.to_numeric(raw[c].astype(str).str.replace(",", ""), errors="coerce")
 
     df = raw[["open", "high", "low", "close", "volume"]].dropna(
         subset=["open", "high", "low", "close"]
     )
 
-    # If data looks like it's sub-4H (hourly or finer), resample up
     if len(df) > 3000:
         df = df.resample("4h").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         }).dropna()
-        print(f"  Resampled to 4H → {len(df)} bars")
+        print(f"  Resampled to 4H -> {len(df)} bars")
 
     return df
 
 
 def generate_synthetic(n_bars: int = 2000, seed: int = 42) -> pd.DataFrame:
-    """
-    Generates ES-like 4H price data with realistic trends, pullbacks, and noise.
-    NOT REAL DATA. For code validation only.
-    """
+    """ES-like 4H data with trends, pullbacks, noise. NOT real data."""
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2024-01-01", periods=n_bars, freq="4h")
 
-    # Build a price series with regime changes (trend up, trend down, sideways)
     price = 4500.0
     prices = []
     regime_len = 80
     for i in range(n_bars):
         if i % regime_len == 0:
-            # New regime: -1=down, 0=sideways, 1=up
             regime = rng.choice([-1, 0, 1], p=[0.4, 0.2, 0.4])
             drift = regime * 0.15
             vol = 8.0
-        # Add mean-reverting pullbacks every ~15 bars within trends
         pullback_factor = -0.3 * drift if (i % 15 < 4) else 1.0
         ret = drift * pullback_factor + rng.normal(0, vol)
         price += ret
         prices.append(price)
 
     closes = np.array(prices)
-    # Build OHLC around closes
     highs = closes + np.abs(rng.normal(0, 4, n_bars))
     lows = closes - np.abs(rng.normal(0, 4, n_bars))
     opens = np.roll(closes, 1)
     opens[0] = closes[0]
 
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "open": opens, "high": highs, "low": lows,
         "close": closes, "volume": rng.integers(1000, 10000, n_bars),
     }, index=dates)
-    return df
 
 
 # =============================================================================
@@ -227,7 +204,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema"] = df["close"].ewm(span=P.ema_period, adjust=False).mean()
 
-    # ATR
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
@@ -235,7 +211,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.rolling(P.atr_period).mean()
 
-    # Bollinger
     df["bb_mid"] = df["close"].rolling(P.bb_period).mean()
     bb_std = df["close"].rolling(P.bb_period).std()
     df["bb_upper"] = df["bb_mid"] + P.bb_std * bb_std
@@ -249,63 +224,51 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 @dataclass
 class RZYStructure:
-    """A detected Little RZY pattern (downtrend short setup)."""
+    direction: str               # "short" or "long"
     impulse_start_idx: int
-    impulse_end_idx: int        # bar of lowest low
-    pullback_end_idx: int       # bar where pullback peaked
-    lowest_low: float
-    trendline_slope: float      # of pullback highs
+    impulse_end_idx: int         # bar of the impulse extreme (low for short, high for long)
+    pullback_end_idx: int
+    impulse_extreme: float       # lowest low (short) or highest high (long)
+    trendline_slope: float       # fit across pullback highs (short) or lows (long)
     trendline_intercept: float
-    measured_distance: float    # vertical low->trendline
+    measured_distance: float     # vertical distance from extreme to trendline
     target_price: float
-    rzy_number: int = 1         # which RZY in this trend sequence
+    rzy_number: int = 1
 
 
 def trendline_at(struct: RZYStructure, idx: int) -> float:
-    """Value of pullback-high trendline at a given bar index."""
     return struct.trendline_slope * idx + struct.trendline_intercept
 
 
 def detect_short_structures(df: pd.DataFrame) -> list[RZYStructure]:
-    """
-    Walk forward bar by bar, finding short setups.
-    A setup = downtrend impulse + pullback that allows us to draw a trendline
-    across pullback highs.
-    """
+    """Downtrend: impulse down, pullback up, trendline across pullback highs."""
     structures = []
     i = P.impulse_max_bars + P.pullback_max_bars
-
-    # Track which RZY number we're on within an ongoing downtrend
     current_trend_id = None
     rzy_count_in_trend = 0
 
     while i < len(df) - 1:
         bar = df.iloc[i]
 
-        # Trend filter: must be below EMA
         if bar["close"] >= bar["ema"]:
             current_trend_id = None
             rzy_count_in_trend = 0
             i += 1
             continue
 
-        # Look back for impulse: drop of >= impulse_atr_mult ATR within impulse_max_bars
         atr = bar["atr"]
         impulse_threshold = P.impulse_atr_mult * atr
 
-        # Find the impulse: scan window
         window = df.iloc[max(0, i - P.impulse_max_bars - P.pullback_max_bars):i + 1]
         if len(window) < 5:
             i += 1
             continue
 
-        # Lowest low in recent window
         low_idx_rel = window["low"].values.argmin()
         low_idx = window.index[low_idx_rel]
         low_iloc = df.index.get_loc(low_idx)
         lowest_low = window["low"].iloc[low_idx_rel]
 
-        # Pre-impulse high: highest high in 8 bars before the low
         pre_window = df.iloc[max(0, low_iloc - P.impulse_max_bars):low_iloc + 1]
         if len(pre_window) < 3:
             i += 1
@@ -317,25 +280,20 @@ def detect_short_structures(df: pd.DataFrame) -> list[RZYStructure]:
             i += 1
             continue
 
-        # Pullback: bars AFTER low_iloc up to current bar i
         pullback = df.iloc[low_iloc + 1:i + 1]
         if len(pullback) < P.pullback_min_bars or len(pullback) > P.pullback_max_bars:
             i += 1
             continue
 
-        # Bounce size check
-        pullback_high = pullback["high"].max()
-        bounce = pullback_high - lowest_low
+        bounce = pullback["high"].max() - lowest_low
         if bounce < P.pullback_min_pct * impulse_size:
             i += 1
             continue
 
-        # Pullback must not have broken below the impulse low
         if pullback["low"].min() < lowest_low:
             i += 1
             continue
 
-        # Fit trendline across pullback highs (linear regression)
         x = np.arange(low_iloc + 1, i + 1)
         y = pullback["high"].values
         if len(x) < 2:
@@ -343,23 +301,16 @@ def detect_short_structures(df: pd.DataFrame) -> list[RZYStructure]:
             continue
         slope, intercept = np.polyfit(x, y, 1)
 
-        # Distance from low to trendline AT THE LOW BAR
-        trendline_at_low = slope * low_iloc + intercept
-        measured = trendline_at_low - lowest_low
+        measured = (slope * low_iloc + intercept) - lowest_low
         if measured <= 0:
             i += 1
             continue
 
-        target = lowest_low - measured
+        if P.use_bollinger_filter and bar["close"] < bar["bb_lower"]:
+            i += 1
+            continue
 
-        # Bollinger filter: for shorts, we want price not already crushed at lower band
-        if P.use_bollinger_filter:
-            if bar["close"] < bar["bb_lower"]:
-                i += 1
-                continue  # too extended already
-
-        # Exhaustion filter: count RZYs in this trend
-        trend_id_now = low_iloc // 50  # crude: group nearby setups into same trend
+        trend_id_now = low_iloc // 50
         if current_trend_id != trend_id_now:
             current_trend_id = trend_id_now
             rzy_count_in_trend = 1
@@ -371,19 +322,121 @@ def detect_short_structures(df: pd.DataFrame) -> list[RZYStructure]:
             continue
 
         structures.append(RZYStructure(
+            direction="short",
             impulse_start_idx=low_iloc - len(pre_window) + 1,
             impulse_end_idx=low_iloc,
             pullback_end_idx=i,
-            lowest_low=lowest_low,
+            impulse_extreme=lowest_low,
             trendline_slope=slope,
             trendline_intercept=intercept,
             measured_distance=measured,
-            target_price=target,
+            target_price=lowest_low - measured * P.target_scale,
             rzy_number=rzy_count_in_trend,
         ))
-        # Skip ahead so we don't redetect the same structure
         i += P.pullback_min_bars
-        continue
+
+    return structures
+
+
+def detect_long_structures(df: pd.DataFrame) -> list[RZYStructure]:
+    """Uptrend: impulse up, pullback down, trendline across pullback lows."""
+    structures = []
+    i = P.impulse_max_bars + P.pullback_max_bars
+    current_trend_id = None
+    rzy_count_in_trend = 0
+
+    while i < len(df) - 1:
+        bar = df.iloc[i]
+
+        if bar["close"] <= bar["ema"]:
+            current_trend_id = None
+            rzy_count_in_trend = 0
+            i += 1
+            continue
+
+        atr = bar["atr"]
+        impulse_threshold = P.impulse_atr_mult * atr
+
+        window = df.iloc[max(0, i - P.impulse_max_bars - P.pullback_max_bars):i + 1]
+        if len(window) < 5:
+            i += 1
+            continue
+
+        # Impulse extreme is the highest high
+        high_idx_rel = window["high"].values.argmax()
+        high_idx = window.index[high_idx_rel]
+        high_iloc = df.index.get_loc(high_idx)
+        highest_high = window["high"].iloc[high_idx_rel]
+
+        pre_window = df.iloc[max(0, high_iloc - P.impulse_max_bars):high_iloc + 1]
+        if len(pre_window) < 3:
+            i += 1
+            continue
+        impulse_low = pre_window["low"].min()
+        impulse_size = highest_high - impulse_low
+
+        if impulse_size < impulse_threshold:
+            i += 1
+            continue
+
+        pullback = df.iloc[high_iloc + 1:i + 1]
+        if len(pullback) < P.pullback_min_bars or len(pullback) > P.pullback_max_bars:
+            i += 1
+            continue
+
+        # Pullback down must retrace >= 30% of impulse
+        bounce = highest_high - pullback["low"].min()
+        if bounce < P.pullback_min_pct * impulse_size:
+            i += 1
+            continue
+
+        # Pullback must not break above the impulse high
+        if pullback["high"].max() > highest_high:
+            i += 1
+            continue
+
+        # Trendline across pullback lows
+        x = np.arange(high_iloc + 1, i + 1)
+        y = pullback["low"].values
+        if len(x) < 2:
+            i += 1
+            continue
+        slope, intercept = np.polyfit(x, y, 1)
+
+        measured = highest_high - (slope * high_iloc + intercept)
+        if measured <= 0:
+            i += 1
+            continue
+
+        # Bollinger filter: don't buy when already stretched to upper band
+        if P.use_bollinger_filter and bar["close"] > bar["bb_upper"]:
+            i += 1
+            continue
+
+        trend_id_now = high_iloc // 50
+        if current_trend_id != trend_id_now:
+            current_trend_id = trend_id_now
+            rzy_count_in_trend = 1
+        else:
+            rzy_count_in_trend += 1
+
+        if P.use_exhaustion_filter and rzy_count_in_trend > P.max_rzy_per_trend:
+            i += 1
+            continue
+
+        structures.append(RZYStructure(
+            direction="long",
+            impulse_start_idx=high_iloc - len(pre_window) + 1,
+            impulse_end_idx=high_iloc,
+            pullback_end_idx=i,
+            impulse_extreme=highest_high,
+            trendline_slope=slope,
+            trendline_intercept=intercept,
+            measured_distance=measured,
+            target_price=highest_high + measured * P.target_scale,
+            rzy_number=rzy_count_in_trend,
+        ))
+        i += P.pullback_min_bars
 
     return structures
 
@@ -409,8 +462,7 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
     trades = []
 
     for s in structures:
-        # Entry trigger: STRICT — after pullback_end, look for price to touch
-        # the trendline (extended forward) then close back below it
+        is_short = s.direction == "short"
         entry_idx = None
         entry_price = None
 
@@ -418,27 +470,40 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
         for j in range(s.pullback_end_idx + 1, search_end):
             tl_val = trendline_at(s, j)
             bar = df.iloc[j]
-            # Touch = high reaches within tolerance of trendline
-            touched = bar["high"] >= tl_val * (1 - P.entry_touch_tolerance)
-            closed_below = bar["close"] < tl_val
-            if touched and closed_below:
+
+            if is_short:
+                # High touches trendline, then closes back below it
+                touched = bar["high"] >= tl_val * (1 - P.entry_touch_tolerance)
+                confirmed = bar["close"] < tl_val
+                invalidated = bar["close"] > tl_val * 1.002
+            else:
+                # Low touches trendline, then closes back above it
+                touched = bar["low"] <= tl_val * (1 + P.entry_touch_tolerance)
+                confirmed = bar["close"] > tl_val
+                invalidated = bar["close"] < tl_val * 0.998
+
+            if touched and confirmed:
                 entry_idx = j
                 entry_price = bar["close"]
                 break
-            # Invalidation: close above trendline by clear margin
-            if bar["close"] > tl_val * 1.002:
+            if invalidated:
                 break
 
         if entry_idx is None:
             continue
 
-        # Stop = trendline at entry bar + ATR buffer
         atr_at_entry = df.iloc[entry_idx]["atr"]
         tl_at_entry = trendline_at(s, entry_idx)
-        stop = tl_at_entry + P.stop_buffer_atr * atr_at_entry
 
-        if stop <= entry_price:
-            continue  # bad geometry
+        if is_short:
+            stop = tl_at_entry + P.stop_buffer_atr * atr_at_entry
+            risk_per_unit = stop - entry_price
+        else:
+            stop = tl_at_entry - P.stop_buffer_atr * atr_at_entry
+            risk_per_unit = entry_price - stop
+
+        if risk_per_unit <= 0:
+            continue
 
         trade = Trade(
             structure=s,
@@ -448,48 +513,62 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
             target_price=s.target_price,
         )
 
-        # Walk forward bar by bar to find exit
-        risk_per_unit = stop - entry_price  # positive number
         for k in range(entry_idx + 1, len(df)):
             bar = df.iloc[k]
-            # Stop hit?
-            if bar["high"] >= stop:
+
+            if is_short:
+                stop_hit = bar["high"] >= stop
+                target_hit = bar["low"] <= s.target_price
+            else:
+                stop_hit = bar["low"] <= stop
+                target_hit = bar["high"] >= s.target_price
+
+            if stop_hit:
                 trade.exit_idx = k
                 trade.exit_price = stop
                 trade.exit_reason = "stop"
-                trade.r_multiple = (entry_price - stop) / risk_per_unit  # = -1
+                trade.r_multiple = -1.0
                 break
-            # Target hit?
-            if bar["low"] <= s.target_price:
+            if target_hit:
                 trade.exit_idx = k
                 trade.exit_price = s.target_price
                 trade.exit_reason = "target"
-                trade.r_multiple = (entry_price - s.target_price) / risk_per_unit
+                if is_short:
+                    trade.r_multiple = (entry_price - s.target_price) / risk_per_unit
+                else:
+                    trade.r_multiple = (s.target_price - entry_price) / risk_per_unit
                 break
-            # Time stop: 50 bars
             if k - entry_idx > 50:
                 trade.exit_idx = k
                 trade.exit_price = bar["close"]
                 trade.exit_reason = "timeout"
-                trade.r_multiple = (entry_price - bar["close"]) / risk_per_unit
+                if is_short:
+                    trade.r_multiple = (entry_price - bar["close"]) / risk_per_unit
+                else:
+                    trade.r_multiple = (bar["close"] - entry_price) / risk_per_unit
                 break
 
         if trade.exit_idx is None:
-            # still open at end of data — close at last bar
             trade.exit_idx = len(df) - 1
             trade.exit_price = df.iloc[-1]["close"]
             trade.exit_reason = "end_of_data"
-            trade.r_multiple = (entry_price - trade.exit_price) / risk_per_unit
+            if is_short:
+                trade.r_multiple = (entry_price - trade.exit_price) / risk_per_unit
+            else:
+                trade.r_multiple = (trade.exit_price - entry_price) / risk_per_unit
 
-        # PnL in $ (ES = $50/point)
         ES_MULTIPLIER = 50
-        # Position size from fixed-fractional risk
         risk_dollars = P.starting_capital * P.risk_per_trade
         contracts = max(1, int(risk_dollars / (risk_per_unit * ES_MULTIPLIER)))
-        trade.pnl = (entry_price - trade.exit_price) * ES_MULTIPLIER * contracts - P.commission_per_trade
+        if is_short:
+            trade.pnl = (entry_price - trade.exit_price) * ES_MULTIPLIER * contracts - P.commission_per_trade
+        else:
+            trade.pnl = (trade.exit_price - entry_price) * ES_MULTIPLIER * contracts - P.commission_per_trade
 
         trades.append(trade)
 
+    # Sort by entry time so equity curve is chronological
+    trades.sort(key=lambda t: t.entry_idx)
     return trades
 
 
@@ -510,15 +589,19 @@ def report(trades: list[Trade], df: pd.DataFrame) -> dict:
     expectancy_r = win_rate * avg_win_r + (1 - win_rate) * avg_loss_r
     total_pnl = sum(t.pnl for t in trades)
 
-    # Equity curve & drawdown
     pnls = np.array([t.pnl for t in trades])
     equity = P.starting_capital + np.cumsum(pnls)
     running_max = np.maximum.accumulate(equity)
     dd = (equity - running_max) / running_max
     max_dd = dd.min()
 
+    longs  = [t for t in trades if t.structure.direction == "long"]
+    shorts = [t for t in trades if t.structure.direction == "short"]
+
     stats = {
         "trades": n,
+        "  longs": len(longs),
+        "  shorts": len(shorts),
         "win_rate": win_rate,
         "avg_win_R": avg_win_r,
         "avg_loss_R": avg_loss_r,
@@ -539,7 +622,6 @@ def report(trades: list[Trade], df: pd.DataFrame) -> dict:
             print(f"  {k:25s} {v:>12}")
     print("=" * 50)
 
-    # Reasons breakdown
     from collections import Counter
     reasons = Counter(t.exit_reason for t in trades)
     print("\nExit reasons:")
@@ -557,7 +639,7 @@ def plot_equity(trades: list[Trade], path: str):
                                     gridspec_kw={"height_ratios": [3, 1]})
     ax1.plot(equity, linewidth=1.5, color="#1f77b4")
     ax1.axhline(P.starting_capital, color="gray", linestyle="--", alpha=0.5)
-    ax1.set_title("Equity Curve — Little RZY Strategy (ES 4H)", fontsize=13)
+    ax1.set_title("Equity Curve — Little RZY Strategy (ES 4H, Long + Short)", fontsize=13)
     ax1.set_ylabel("Account Equity ($)")
     ax1.grid(alpha=0.3)
 
@@ -579,9 +661,7 @@ def plot_sample_trades(df: pd.DataFrame, trades: list[Trade], path: str, n_sampl
     if n_samples == 0:
         return
 
-    # Pick: best winner, worst loser, and a middle one
     sorted_trades = sorted(trades, key=lambda t: t.r_multiple)
-    samples = []
     if len(trades) >= 3:
         samples = [sorted_trades[0], sorted_trades[len(trades) // 2], sorted_trades[-1]]
     else:
@@ -593,11 +673,11 @@ def plot_sample_trades(df: pd.DataFrame, trades: list[Trade], path: str, n_sampl
 
     for ax, t in zip(axes, samples):
         s = t.structure
+        is_short = s.direction == "short"
         start = max(0, s.impulse_start_idx - 10)
         end = min(len(df) - 1, t.exit_idx + 5)
         window = df.iloc[start:end + 1]
 
-        # Candles (simplified bars)
         for idx in range(len(window)):
             row = window.iloc[idx]
             x = start + idx
@@ -607,21 +687,23 @@ def plot_sample_trades(df: pd.DataFrame, trades: list[Trade], path: str, n_sampl
                                     0.6, abs(row["close"] - row["open"]),
                                     facecolor=color, alpha=0.6, edgecolor=color))
 
-        # Trendline
         x_tl = np.array([s.impulse_end_idx, t.exit_idx])
         y_tl = s.trendline_slope * x_tl + s.trendline_intercept
         ax.plot(x_tl, y_tl, "b--", linewidth=1.5, label="Pullback trendline")
 
-        # Mark low and target
-        ax.axhline(s.lowest_low, color="purple", linestyle=":", alpha=0.6, label=f"Low {s.lowest_low:.1f}")
+        extreme_label = f"{'Low' if is_short else 'High'} {s.impulse_extreme:.1f}"
+        ax.axhline(s.impulse_extreme, color="purple", linestyle=":", alpha=0.6, label=extreme_label)
         ax.axhline(s.target_price, color="green", linestyle=":", alpha=0.6, label=f"Target {s.target_price:.1f}")
         ax.axhline(t.stop_price, color="red", linestyle=":", alpha=0.6, label=f"Stop {t.stop_price:.1f}")
 
-        # Entry/exit markers
-        ax.scatter([t.entry_idx], [t.entry_price], color="black", marker="v", s=80, zorder=5, label="Entry")
-        ax.scatter([t.exit_idx], [t.exit_price], color="orange", marker="x", s=100, zorder=5, label=f"Exit ({t.exit_reason})")
+        entry_marker = "v" if is_short else "^"
+        ax.scatter([t.entry_idx], [t.entry_price], color="black", marker=entry_marker,
+                   s=80, zorder=5, label="Entry")
+        ax.scatter([t.exit_idx], [t.exit_price], color="orange", marker="x",
+                   s=100, zorder=5, label=f"Exit ({t.exit_reason})")
 
-        ax.set_title(f"Trade R={t.r_multiple:+.2f}  PnL=${t.pnl:+.0f}  ({t.exit_reason})")
+        direction_label = "SHORT" if is_short else "LONG"
+        ax.set_title(f"[{direction_label}] R={t.r_multiple:+.2f}  PnL=${t.pnl:+.0f}  ({t.exit_reason})")
         ax.legend(loc="best", fontsize=8)
         ax.grid(alpha=0.3)
 
@@ -634,16 +716,17 @@ def trades_to_df(trades: list[Trade], df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for t in trades:
         rows.append({
-            "entry_time": df.index[t.entry_idx],
-            "exit_time": df.index[t.exit_idx] if t.exit_idx else None,
-            "rzy_number": t.structure.rzy_number,
-            "entry": round(t.entry_price, 2),
-            "stop": round(t.stop_price, 2),
-            "target": round(t.target_price, 2),
-            "exit": round(t.exit_price, 2) if t.exit_price else None,
+            "entry_time":  df.index[t.entry_idx],
+            "exit_time":   df.index[t.exit_idx] if t.exit_idx else None,
+            "direction":   t.structure.direction,
+            "rzy_number":  t.structure.rzy_number,
+            "entry":       round(t.entry_price, 2),
+            "stop":        round(t.stop_price, 2),
+            "target":      round(t.target_price, 2),
+            "exit":        round(t.exit_price, 2) if t.exit_price else None,
             "exit_reason": t.exit_reason,
-            "r_multiple": round(t.r_multiple, 2),
-            "pnl_usd": round(t.pnl, 2),
+            "r_multiple":  round(t.r_multiple, 2),
+            "pnl_usd":     round(t.pnl, 2),
         })
     return pd.DataFrame(rows)
 
@@ -653,18 +736,21 @@ def trades_to_df(trades: list[Trade], df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["yahoo", "csv", "databento", "synthetic"], default="synthetic")
-    parser.add_argument("--file", default=None)
-    parser.add_argument("--key", default=None, help="Databento API key")
+    parser.add_argument("--source", choices=["yahoo", "csv", "databento", "synthetic"],
+                        default="synthetic")
+    parser.add_argument("--file",  default=None,         help="CSV path (for --source csv)")
+    parser.add_argument("--key",   default=None,         help="Databento API key")
     parser.add_argument("--start", default="2020-01-01", help="Start date (databento)")
-    parser.add_argument("--end", default="2025-01-01", help="End date (databento)")
-    parser.add_argument("--out", default=".")
+    parser.add_argument("--end",   default="2025-01-01", help="End date (databento)")
+    parser.add_argument("--out",   default=".",          help="Output directory")
     args = parser.parse_args()
 
     print(f"Loading data ({args.source})...")
     if args.source == "yahoo":
         df = load_yahoo()
     elif args.source == "csv":
+        if not args.file:
+            raise SystemExit("--file is required for --source csv")
         df = load_csv(args.file)
     elif args.source == "databento":
         if not args.key:
@@ -680,22 +766,26 @@ def main():
     print(f"  {len(df)} bars after indicators")
 
     print("Detecting Little RZY structures...")
-    structures = detect_short_structures(df)
-    print(f"  Found {len(structures)} structures")
+    short_structs = detect_short_structures(df)
+    long_structs  = detect_long_structures(df)
+    structures = short_structs + long_structs
+    print(f"  Found {len(short_structs)} short + {len(long_structs)} long = {len(structures)} total")
 
     print("Simulating trades...")
     trades = simulate(df, structures)
-    print(f"  {len(trades)} trades executed (entry trigger fired)")
+    n_long  = sum(1 for t in trades if t.structure.direction == "long")
+    n_short = sum(1 for t in trades if t.structure.direction == "short")
+    print(f"  {len(trades)} trades executed ({n_long} long, {n_short} short)")
 
     stats = report(trades, df)
 
     if trades:
         td = trades_to_df(trades, df)
         td.to_csv(f"{args.out}/trades.csv", index=False)
-        print(f"\nTrade log -> {args.out}/trades.csv")
+        print(f"\nTrade log     -> {args.out}/trades.csv")
 
         plot_equity(trades, f"{args.out}/equity_curve.png")
-        print(f"Equity curve -> {args.out}/equity_curve.png")
+        print(f"Equity curve  -> {args.out}/equity_curve.png")
 
         plot_sample_trades(df, trades, f"{args.out}/sample_trades.png")
         print(f"Sample trades -> {args.out}/sample_trades.png")
