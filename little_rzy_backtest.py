@@ -519,8 +519,16 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
             target_price=s.target_price,
         )
 
+        breakeven_triggered = False
         for k in range(entry_idx + 1, len(df)):
             bar = df.iloc[k]
+
+            # Move stop to breakeven once trade is 1R in profit
+            if not breakeven_triggered:
+                profit = (entry_price - bar["close"]) if is_short else (bar["close"] - entry_price)
+                if profit >= risk_per_unit:
+                    stop = entry_price
+                    breakeven_triggered = True
 
             if is_short:
                 stop_hit = bar["high"] >= stop
@@ -532,8 +540,8 @@ def simulate(df: pd.DataFrame, structures: list[RZYStructure]) -> list[Trade]:
             if stop_hit:
                 trade.exit_idx = k
                 trade.exit_price = stop
-                trade.exit_reason = "stop"
-                trade.r_multiple = -1.0
+                trade.exit_reason = "stop" if not breakeven_triggered else "breakeven"
+                trade.r_multiple = (entry_price - stop) / risk_per_unit if is_short else (stop - entry_price) / risk_per_unit
                 break
             if target_hit:
                 trade.exit_idx = k
